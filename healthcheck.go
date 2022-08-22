@@ -13,6 +13,7 @@ import (
 )
 
 type Resource interface {
+	Name() string
 	Ping(ctx context.Context) error
 }
 
@@ -51,9 +52,9 @@ func New(ctx context.Context, options ...Option) app.App {
 }
 
 func (hc *healthCheck) Run(ctx context.Context) error {
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	var multiErr error
+	mu := sync.Mutex{}
+	wg := sync.WaitGroup{}
+	multiErr := &multierror.Error{}
 
 	wg.Add(1)
 
@@ -75,57 +76,59 @@ func (hc *healthCheck) Run(ctx context.Context) error {
 
 	wg.Wait()
 
-	return multiErr
+	return multiErr.ErrorOrNil()
 }
+
+type (
+	resStat struct {
+		Name  string `json:"name,omitempty"`
+		Error string `json:"error,omitempty"`
+	}
+	pingResult struct {
+		Ok        bool      `json:"ok"`
+		Resources []resStat `json:"resources"`
+	}
+)
 
 func (hc *healthCheck) pingHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), hc.timeout)
 		defer cancel()
 
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		var multiErr error
+		mu := sync.Mutex{}
+		wg := sync.WaitGroup{}
+		pr := pingResult{Ok: true}
 
 		wg.Add(len(hc.resources))
 
 		for _, res := range hc.resources {
-			resource := res
-			go func() {
+			go func(res Resource) {
 				defer wg.Done()
-				if err := resource.Ping(ctx); err != nil {
+				if err := res.Ping(ctx); err != nil {
 					mu.Lock()
-					defer mu.Unlock()
-					multiErr = multierror.Append(multiErr, err)
+					pr.Ok = false
+					pr.Resources = append(pr.Resources, resStat{
+						Name:  res.Name(),
+						Error: err.Error(),
+					})
+					mu.Unlock()
 				}
-			}()
+			}(res)
 		}
 
 		wg.Wait()
 
-		if ctx.Err() != nil {
-			status(w, "ping timed out", false)
-			return
-		}
-
-		if multiErr != nil {
-			status(w, multiErr.Error(), false)
-			return
-		}
-
-		status(w, "all resources are good", true)
+		reportStatus(w, pr)
 	}
 }
 
-func status(w http.ResponseWriter, message string, ok bool) {
-	st := struct {
-		Message string `json:"message"`
-		Ok      bool   `json:"ok"`
-	}{
-		Message: message,
-		Ok:      ok,
+func reportStatus(w http.ResponseWriter, result pingResult) {
+	bs, err := json.Marshal(result)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	bs, _ := json.Marshal(st)
+
 	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-type", "application/json")
 	w.Write(bs)
